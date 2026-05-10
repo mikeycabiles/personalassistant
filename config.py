@@ -6,12 +6,22 @@ to ephemeral paths so calendar_tools.py can hand them to google-auth.
 
 import base64
 import os
+from datetime import timedelta, timezone
 from pathlib import Path
 
 import pytz
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+# Fixed Eastern Standard Time (UTC-5). Used for daily briefing schedules so
+# the 8am/8pm jobs fire at the same wall-clock hour year-round, ignoring DST.
+EST_FIXED = timezone(timedelta(hours=-5))
+
+
+# Name the agent answers to. Surfaces in greetings and self-references.
+AGENT_NAME = "Kiki"
 
 
 class _Missing:
@@ -170,3 +180,18 @@ GOOGLE_TOKEN_PATH = _materialize(
 DB_PATH = str(_PROJECT_ROOT / "assistant.db")
 
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
+
+
+# --- Blocked-day detection -------------------------------------------------
+#
+# All-day events whose title contains any of these (case-insensitive) substrings
+# are treated as "do-not-schedule" days. The user controls this via Google
+# Calendar — create an all-day event titled e.g. "Office", "OOO", "W2 onsite"
+# and Kiki will refuse to book over it.
+
+_DEFAULT_BLOCKED_KEYWORDS = "office,ooo,out of office,onsite,in-person,w2,do not schedule"
+BLOCKED_DAY_KEYWORDS = [
+    kw.strip().lower()
+    for kw in (_optional("BLOCKED_DAY_KEYWORDS", default=_DEFAULT_BLOCKED_KEYWORDS) or "").split(",")
+    if kw.strip()
+]

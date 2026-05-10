@@ -24,7 +24,7 @@ import anthropic
 import calendar_tools
 import config
 import database as db
-from prompts import PROPOSAL_EXTRACTION_PROMPT, SYSTEM_PROMPT
+from prompts import PROPOSAL_EXTRACTION_PROMPT, render_system_prompt
 
 
 logger = logging.getLogger(__name__)
@@ -35,6 +35,8 @@ client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
 # --- Tool registry ---------------------------------------------------------
 
+# `remember_scheduling_lesson` is dispatched specially because it needs the
+# user_id, which the calendar tools don't take. It's wired in _execute_tool.
 TOOL_FUNCTIONS = {
     "get_events": calendar_tools.get_events,
     "find_free_slots": calendar_tools.find_free_slots,
@@ -44,9 +46,11 @@ TOOL_FUNCTIONS = {
     "get_todays_schedule": calendar_tools.get_todays_schedule,
     "get_weeks_schedule": calendar_tools.get_weeks_schedule,
     "search_events": calendar_tools.search_events,
+    "check_day_blocked": calendar_tools.check_day_blocked,
+    "block_day": calendar_tools.block_day,
 }
 
-WRITE_TOOL_NAMES = {"create_event", "update_event", "delete_event"}
+WRITE_TOOL_NAMES = {"create_event", "update_event", "delete_event", "block_day"}
 
 TOOLS: list[dict[str, Any]] = [
     {
@@ -215,6 +219,78 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["query"],
         },
     },
+    {
+        "name": "check_day_blocked",
+        "description": (
+            "Check whether a given date is reserved as an office/OOO/onsite day. "
+            "Returns blocked=true with a reason if Mikey has an all-day event matching "
+            "the configured do-not-schedule keywords. Use this BEFORE proposing a slot "
+            "if you're not sure whether the day is workable."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "Date in YYYY-MM-DD format."}
+            },
+            "required": ["date"],
+        },
+    },
+    {
+        "name": "block_day",
+        "description": (
+            "Mark a day (or inclusive date range) as blocked by creating an all-day "
+            "calendar event with a do-not-schedule label. Use when Mikey says things "
+            "like 'I'm in office Tuesday' or 'Block off next Monday-Wednesday for OOO'. "
+            "ALWAYS confirm the date(s) and label with Mikey before calling."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date": {
+                    "type": "string",
+                    "description": "Start date in YYYY-MM-DD.",
+                },
+                "label": {
+                    "type": "string",
+                    "description": (
+                        "Title for the all-day event, e.g. 'Office', 'OOO - vacation', "
+                        "'W2 onsite'. A do-not-schedule tag is appended automatically "
+                        "if the label doesn't already match a block keyword."
+                    ),
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "Optional inclusive end date in YYYY-MM-DD for multi-day blocks.",
+                },
+            },
+            "required": ["date", "label"],
+        },
+    },
+    {
+        "name": "remember_scheduling_lesson",
+        "description": (
+            "Persist a scheduling preference or rule that Mikey just taught you "
+            "(usually after he reports an issue with how you booked something). "
+            "These lessons are injected into your system prompt every conversation. "
+            "Use this when Mikey says things like 'I prefer 2-hour deep work blocks', "
+            "'Don't book me before 9 on Mondays', 'Always leave 30 min after my office days'. "
+            "Phrase the lesson as a concise rule, not a story."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "lesson": {
+                    "type": "string",
+                    "description": (
+                        "A short, actionable rule Kiki should follow going forward. "
+                        "Imperative or declarative tone. Example: 'Mikey prefers deep work "
+                        "blocks of at least 2 hours.'"
+                    ),
+                }
+            },
+            "required": ["lesson"],
+        },
+    },
 ]
 
 
@@ -297,7 +373,22 @@ def _execute_pending(action_type: str, action_data: dict[str, Any]) -> str:
 
 # --- Tool execution --------------------------------------------------------
 
-def _execute_tool(name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
+def _execute_tool(
+    name: str, tool_input: dict[str, Any], user_id: str
+) -> dict[str, Any]:
+    # Special-case the lesson-recording tool because it persists per-user,
+    # not against the calendar.
+    if name == "remember_scheduling_lesson":
+        lesson = (tool_input.get("lesson") or "").strip()
+        if not lesson:
+            return {"success": False, "error": "lesson must be a non-empty string"}
+        try:
+            learning_id = db.add_learning(user_id, lesson)
+            return {"success": True, "learning_id": learning_id, "error": None}
+        except Exception as exc:
+            logger.exception("Failed to persist learning")
+            return {"success": False, "error": f"Could not save lesson: {exc}"}
+
     func = TOOL_FUNCTIONS.get(name)
     if func is None:
         return {"success": False, "error": f"Unknown tool: {name}"}
@@ -406,6 +497,10 @@ def run_agent(user_id: str, user_message: str) -> str:
             {"role": "user", "content": prepended}
         ]
 
+        # System prompt with persisted lessons inlined.
+        learnings = [row["content"] for row in db.get_learnings(user_id, limit=30)]
+        system_prompt = render_system_prompt(learnings)
+
         # 3. Tool-use loop. Cap iterations as a safety net.
         write_tools_called: list[str] = []
         response = None
@@ -414,7 +509,7 @@ def run_agent(user_id: str, user_message: str) -> str:
                 model=config.CLAUDE_MODEL,
                 max_tokens=1024,
                 temperature=0,
-                system=SYSTEM_PROMPT,
+                system=system_prompt,
                 messages=messages,
                 tools=TOOLS,
             )
@@ -426,7 +521,7 @@ def run_agent(user_id: str, user_message: str) -> str:
             for tu in tool_use_blocks:
                 if tu.name in WRITE_TOOL_NAMES:
                     write_tools_called.append(tu.name)
-                result = _execute_tool(tu.name, dict(tu.input))
+                result = _execute_tool(tu.name, dict(tu.input), user_id)
                 tool_results.append(
                     {
                         "type": "tool_result",

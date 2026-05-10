@@ -54,6 +54,18 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_pending_actions_user
                 ON pending_actions(user_id, id);
+
+            -- Long-term scheduling lessons. Injected into every system prompt
+            -- so Kiki applies them automatically and doesn't repeat past mistakes.
+            CREATE TABLE IF NOT EXISTS learnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_learnings_user
+                ON learnings(user_id, id);
             """
         )
 
@@ -156,3 +168,47 @@ def get_pending_action(user_id: str) -> dict[str, Any] | None:
 def clear_pending_action(user_id: str) -> None:
     with _connect() as conn:
         conn.execute("DELETE FROM pending_actions WHERE user_id = ?", (user_id,))
+
+
+# --- Learnings -------------------------------------------------------------
+
+def add_learning(user_id: str, content: str) -> int:
+    """Append a long-term scheduling lesson. Returns the row id."""
+    cleaned = content.strip()
+    if not cleaned:
+        raise ValueError("learning content must not be empty")
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO learnings (user_id, content) VALUES (?, ?)",
+            (user_id, cleaned),
+        )
+        return cur.lastrowid
+
+
+def get_learnings(user_id: str, limit: int = 30) -> list[dict[str, Any]]:
+    """Return the most recent `limit` learnings, newest first."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, content FROM learnings
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        ).fetchall()
+    return [{"id": r["id"], "content": r["content"]} for r in rows]
+
+
+def delete_learning(user_id: str, learning_id: int) -> bool:
+    with _connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM learnings WHERE user_id = ? AND id = ?",
+            (user_id, learning_id),
+        )
+        return cur.rowcount > 0
+
+
+def clear_all_learnings(user_id: str) -> None:
+    with _connect() as conn:
+        conn.execute("DELETE FROM learnings WHERE user_id = ?", (user_id,))

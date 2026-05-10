@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import time
 
 from telegram import Update
 from telegram.constants import ChatAction
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -54,12 +56,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await check_allowed_user(update, context):
         return
     await update.message.reply_text(
-        "Ready.\n\n"
+        f"{config.AGENT_NAME} here.\n\n"
         "Send me a task or meeting in plain English and I'll find a slot.\n\n"
+        f"You'll get a morning briefing at 8am EST and an evening review at 8pm EST.\n\n"
         "Commands:\n"
         "/today - today's schedule\n"
         "/week - this week's schedule\n"
-        "/clear - reset our conversation context\n"
+        "/lessons - what I've learned about your preferences\n"
+        "/clear - reset our short-term conversation context\n"
         "/help - this menu"
     )
 
@@ -72,13 +76,18 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/start - welcome message\n"
         "/today - today's schedule\n"
         "/week - this week's schedule (Mon-Sun)\n"
-        "/clear - reset our conversation context\n"
+        "/lessons - long-term scheduling rules I've learned\n"
+        "/clear - reset our short-term conversation context (lessons preserved)\n"
         "/help - this menu\n\n"
         "Or just message me normally:\n"
         "  - 'New task: review proposal, 45 min'\n"
         "  - 'Block 9am tomorrow for deep work, 2 hours'\n"
         "  - 'Move my 3pm meeting to 4pm'\n"
-        "  - 'What's on Thursday?'"
+        "  - 'I'm in office Tuesday, block it'\n"
+        "  - 'What's on Thursday?'\n\n"
+        "Office/OOO days: Mark them as ALL-DAY events on your Google Calendar with "
+        "titles like 'Office', 'OOO', or 'W2 onsite'. I won't schedule on those days "
+        "unless you explicitly tell me to."
     )
 
 
@@ -136,7 +145,27 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
     db.clear_all_history(user_id)
     db.clear_pending_action(user_id)
-    await update.message.reply_text("Conversation cleared.")
+    await update.message.reply_text(
+        "Conversation cleared. (Your saved scheduling preferences are kept - "
+        "use the agent to remove them if needed.)"
+    )
+
+
+async def cmd_lessons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_allowed_user(update, context):
+        return
+    user_id = str(update.effective_user.id)
+    learnings = db.get_learnings(user_id, limit=50)
+    if not learnings:
+        await update.message.reply_text(
+            "No saved preferences yet. I'll learn as we go - tell me when I "
+            "schedule something wrong and I'll remember next time."
+        )
+        return
+    lines = ["Saved preferences:"]
+    for row in learnings:
+        lines.append(f"  - {row['content']}")
+    await update.message.reply_text("\n".join(lines))
 
 
 # --- Message handler -------------------------------------------------------
@@ -160,6 +189,85 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(response)
 
 
+# --- Scheduled briefings ---------------------------------------------------
+#
+# Fired via JobQueue at fixed wall-clock times in EST (UTC-5, no DST shift).
+# The chat_id is the user's Telegram user_id - direct-message chats use the
+# user_id as the chat_id.
+
+async def morning_briefing(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """8am EST: send today's schedule and ask for adjustments."""
+    chat_id = config.TELEGRAM_ALLOWED_USER_ID
+
+    loop = asyncio.get_running_loop()
+    schedule = await loop.run_in_executor(None, calendar_tools.get_todays_schedule)
+
+    if schedule["success"]:
+        message = (
+            "Morning. Here's today:\n\n"
+            f"{schedule['summary']}\n\n"
+            "Anything to add or adjust?"
+        )
+    else:
+        message = (
+            "Morning. I couldn't load your calendar - "
+            f"{schedule.get('error', 'unknown error')}.\n\n"
+            "Anything to schedule today?"
+        )
+
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=message)
+    except TelegramError as exc:
+        logger.exception("Failed to send morning briefing: %s", exc)
+        return
+
+    # Save to conversation history so the agent has context when the user replies.
+    db.save_message(str(chat_id), "assistant", message)
+    db.clear_old_history(str(chat_id))
+
+
+async def evening_review(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """8pm EST: prompt for issues (to learn from) and tomorrow's adds."""
+    chat_id = config.TELEGRAM_ALLOWED_USER_ID
+    message = (
+        "Evening check-in.\n\n"
+        "Any issues with how I scheduled today? Tell me and I'll save it as a "
+        "rule so it doesn't happen again.\n\n"
+        "Also - anything last-minute or for tomorrow?"
+    )
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=message)
+    except TelegramError as exc:
+        logger.exception("Failed to send evening review: %s", exc)
+        return
+
+    db.save_message(str(chat_id), "assistant", message)
+    db.clear_old_history(str(chat_id))
+
+
+def schedule_daily_briefings(application: Application) -> None:
+    """Register the 8am EST morning briefing and 8pm EST evening review."""
+    job_queue = application.job_queue
+    if job_queue is None:
+        # Should never happen with python-telegram-bot[job-queue]==20.7, but
+        # surface clearly if APScheduler isn't installed.
+        raise RuntimeError(
+            "JobQueue is unavailable. Install python-telegram-bot[job-queue]."
+        )
+
+    job_queue.run_daily(
+        morning_briefing,
+        time=time(hour=8, minute=0, tzinfo=config.EST_FIXED),
+        name="kiki_morning_briefing",
+    )
+    job_queue.run_daily(
+        evening_review,
+        time=time(hour=20, minute=0, tzinfo=config.EST_FIXED),
+        name="kiki_evening_review",
+    )
+    logger.info("Scheduled daily briefings: 08:00 EST and 20:00 EST")
+
+
 # --- Bootstrap -------------------------------------------------------------
 
 def build_application() -> Application:
@@ -169,6 +277,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("today", cmd_today))
     application.add_handler(CommandHandler("week", cmd_week))
     application.add_handler(CommandHandler("clear", cmd_clear))
+    application.add_handler(CommandHandler("lessons", cmd_lessons))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return application
 
@@ -176,6 +285,7 @@ def build_application() -> Application:
 def main() -> None:
     db.init_db()
     application = build_application()
+    schedule_daily_briefings(application)
 
     if config.ENVIRONMENT == "production":
         logger.info("Starting in production mode (webhook on port %s)", config.PORT)

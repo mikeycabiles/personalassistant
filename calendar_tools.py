@@ -145,6 +145,37 @@ def _list_events(time_min: str, time_max: str, query: str | None = None) -> list
     return result.get("items", [])
 
 
+def _is_all_day(raw: dict[str, Any]) -> bool:
+    start = raw.get("start", {})
+    return "date" in start and "dateTime" not in start
+
+
+def _matched_block_keyword(title: str) -> str | None:
+    """Return the first BLOCKED_DAY_KEYWORDS substring matching the title, or None."""
+    if not title:
+        return None
+    lowered = title.lower()
+    for kw in config.BLOCKED_DAY_KEYWORDS:
+        if kw and kw in lowered:
+            return kw
+    return None
+
+
+def _find_blocking_event(raw_events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """First all-day event whose title contains a blocked-day keyword, or None."""
+    for raw in raw_events:
+        if not _is_all_day(raw):
+            continue
+        match = _matched_block_keyword(raw.get("summary", ""))
+        if match:
+            return {
+                "event_id": raw.get("id"),
+                "title": raw.get("summary", ""),
+                "matched_keyword": match,
+            }
+    return None
+
+
 # --- Public tool functions -------------------------------------------------
 
 def get_events(start_date: str, end_date: str) -> dict[str, Any]:
@@ -209,6 +240,19 @@ def find_free_slots(
         time_min, time_max = _day_bounds_rfc3339(target_date)
         raw_events = _list_events(time_min, time_max)
 
+        # If the day is marked as a blocked day (office, OOO, etc.) via an
+        # all-day event, surface no slots and tell the agent why.
+        block = _find_blocking_event(raw_events)
+        if block is not None:
+            return {
+                "success": True,
+                "free_slots": [],
+                "blocked_day": True,
+                "block_reason": block["title"],
+                "block_keyword": block["matched_keyword"],
+                "error": None,
+            }
+
         # Build busy intervals in user TZ. Skip all-day events (they don't block
         # specific timed slots in Mikey's schedule).
         busy: list[tuple[datetime, datetime]] = []
@@ -257,7 +301,13 @@ def find_free_slots(
                     }
                 )
 
-        return {"success": True, "free_slots": slots, "error": None}
+        return {
+            "success": True,
+            "free_slots": slots,
+            "blocked_day": False,
+            "block_reason": None,
+            "error": None,
+        }
     except (RefreshError, RuntimeError) as exc:
         return {"success": False, "free_slots": [], "error": _auth_error_payload(exc)}
     except HttpError as exc:
@@ -266,6 +316,103 @@ def find_free_slots(
     except Exception as exc:
         logger.exception("Unexpected error in find_free_slots")
         return {"success": False, "free_slots": [], "error": f"Unexpected error: {exc}"}
+
+
+def check_day_blocked(date: str) -> dict[str, Any]:
+    """Return whether the given date is blocked by an all-day "do-not-schedule" event.
+
+    A day is blocked when it has any all-day event whose title contains one of
+    the keywords in config.BLOCKED_DAY_KEYWORDS (e.g. "office", "OOO").
+    """
+    try:
+        from datetime import date as date_cls
+
+        target = date_cls.fromisoformat(date)
+        time_min, time_max = _day_bounds_rfc3339(target)
+        raw_events = _list_events(time_min, time_max)
+        block = _find_blocking_event(raw_events)
+        if block is None:
+            return {"success": True, "blocked": False, "reason": None, "error": None}
+        return {
+            "success": True,
+            "blocked": True,
+            "reason": block["title"],
+            "matched_keyword": block["matched_keyword"],
+            "error": None,
+        }
+    except (RefreshError, RuntimeError) as exc:
+        return {"success": False, "blocked": False, "reason": None, "error": _auth_error_payload(exc)}
+    except HttpError as exc:
+        logger.exception("Google Calendar API error in check_day_blocked")
+        return {"success": False, "blocked": False, "reason": None, "error": f"Calendar API error: {exc}"}
+    except Exception as exc:
+        logger.exception("Unexpected error in check_day_blocked")
+        return {"success": False, "blocked": False, "reason": None, "error": f"Unexpected error: {exc}"}
+
+
+def block_day(date: str, label: str, end_date: str | None = None) -> dict[str, Any]:
+    """Mark a single day (or inclusive range) as blocked via an all-day event.
+
+    The event title MUST contain a recognized blocking keyword (or one is added
+    automatically) so future find_free_slots calls treat it as do-not-schedule.
+
+    Args:
+        date: ISO YYYY-MM-DD start date.
+        label: Title for the all-day event (e.g. "Office Day", "OOO - Beach").
+        end_date: Optional ISO YYYY-MM-DD end date for multi-day blocks.
+                  Inclusive (Google requires exclusive, we add 1 day internally).
+    """
+    try:
+        from datetime import date as date_cls
+
+        start_d = date_cls.fromisoformat(date)
+        end_d = date_cls.fromisoformat(end_date) if end_date else start_d
+        if end_d < start_d:
+            return {
+                "success": False,
+                "event_id": None,
+                "error": "end_date is before start_date",
+            }
+
+        # Auto-tag the title so the keyword matcher will recognize it.
+        title = label.strip() or "Blocked"
+        if not _matched_block_keyword(title):
+            title = f"{title} [BLOCK]"
+            # Ensure the synthetic tag is recognized by the matcher. Adding
+            # "block" to the title only works if "block" is a configured keyword;
+            # to be safe, append a guaranteed-recognized keyword.
+            if not _matched_block_keyword(title):
+                title = f"{title} (do not schedule)"
+
+        body = {
+            "summary": title,
+            "start": {"date": start_d.isoformat()},
+            # Google's all-day end date is exclusive, so add 1 day to make the
+            # event cover end_d itself.
+            "end": {"date": (end_d + timedelta(days=1)).isoformat()},
+        }
+
+        service = _get_service()
+        created = (
+            service.events()
+            .insert(calendarId=config.GOOGLE_CALENDAR_ID, body=body)
+            .execute()
+        )
+        return {
+            "success": True,
+            "event_id": created["id"],
+            "event_link": created.get("htmlLink", ""),
+            "title": title,
+            "error": None,
+        }
+    except (RefreshError, RuntimeError) as exc:
+        return {"success": False, "event_id": None, "error": _auth_error_payload(exc)}
+    except HttpError as exc:
+        logger.exception("Google Calendar API error in block_day")
+        return {"success": False, "event_id": None, "error": f"Calendar API error: {exc}"}
+    except Exception as exc:
+        logger.exception("Unexpected error in block_day")
+        return {"success": False, "event_id": None, "error": f"Unexpected error: {exc}"}
 
 
 def create_event(

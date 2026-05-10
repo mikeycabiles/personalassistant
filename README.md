@@ -1,6 +1,14 @@
-# Mikey's Telegram Executive Assistant
+# Mikey's Telegram Executive Assistant - Kiki
 
-A production-grade Telegram bot that manages a Google Calendar via natural-language conversation, powered by Claude Haiku.
+A production-grade Telegram bot named **Kiki** that manages a Google Calendar via natural-language conversation, powered by Claude Haiku.
+
+**What Kiki does:**
+- Schedules tasks and meetings on demand, finding free slots and confirming before booking.
+- Sends a **morning briefing at 8:00 EST** with the day's schedule and asks for adjustments.
+- Sends an **evening review at 20:00 EST** asking what went wrong (so it can learn) and what's needed for tomorrow.
+- Refuses to book over your **W-2 office days** and other blocked days you mark on your Google Calendar.
+- Persists scheduling lessons across conversations so it doesn't repeat mistakes.
+- Both 8am and 8pm fire at fixed UTC-5 (EST) regardless of daylight savings.
 
 ---
 
@@ -172,14 +180,21 @@ git push origin <your-branch>
 
 In order, send these to verify everything works:
 
-1. `/start` — should return the welcome message.
+1. `/start` — should return Kiki's welcome message.
 2. `/today` — today's schedule (probably empty if it's a new calendar).
-3. `New task: review client proposal, should take 45 minutes` — bot checks calendar, proposes a slot.
-4. `yes` — bot creates the event and confirms.
+3. `New task: review client proposal, should take 45 minutes` — Kiki checks calendar, proposes a slot.
+4. `yes` — Kiki creates the event and confirms.
 5. `/today` — the new event should appear.
-6. `Move it to 4pm` — bot updates and confirms.
-7. `Delete that event` — bot asks for confirmation.
+6. `Move it to 4pm` — Kiki updates and confirms.
+7. `Delete that event` — Kiki asks for confirmation.
 8. `yes` — gone.
+
+Then test the new behaviors:
+
+9. On Google Calendar, create an all-day event for tomorrow titled `Office`. Then in Telegram: `Schedule a 1-hour meeting tomorrow afternoon`. Kiki should refuse and suggest another day.
+10. `I prefer 2-hour deep work blocks` — Kiki saves the lesson.
+11. `/lessons` — should list the saved preference.
+12. Wait for 8am or 8pm EST — the briefing message should land automatically.
 
 ---
 
@@ -210,10 +225,38 @@ In order, send these to verify everything works:
 
 ---
 
+## How Blocked Days Work
+
+Mikey marks days he can't take meetings as **all-day events** on his Google Calendar. Kiki recognizes any all-day event whose title (case-insensitive) contains one of the configured keywords and refuses to book over it.
+
+**Default keywords:** `office`, `ooo`, `out of office`, `onsite`, `in-person`, `w2`, `do not schedule`. Override via the `BLOCKED_DAY_KEYWORDS` env var (comma-separated).
+
+**Override behavior:** Tell Kiki explicitly — e.g. *"I know it's an office day, schedule it anyway"* — and she'll book over it. Default behavior is to refuse.
+
+**Letting Kiki block a day for you:** *"Block off next Monday and Tuesday for OOO"* and she'll create the all-day events. The chosen label is auto-tagged with a do-not-schedule keyword so future scheduling respects it.
+
+## How Lessons Work
+
+When you tell Kiki she made a scheduling mistake, she calls `remember_scheduling_lesson` to persist a concise rule. Lessons are injected into her system prompt every conversation, so she applies them without you having to repeat yourself. Use `/lessons` to see what she's learned.
+
+Examples that produce lessons:
+- *"Don't book me before 9am on Mondays."*
+- *"I want at least 30 min after my office days end."*
+- *"Deep work blocks should be 2 hours minimum, not 90 minutes."*
+
+## Daily Briefings
+
+Kiki fires two scheduled messages at fixed Eastern Standard Time (UTC-5; ignores DST):
+
+- **08:00 EST** — Morning briefing with today's schedule and an open question for adjustments.
+- **20:00 EST** — Evening review asking what went wrong (so she can learn) and what's needed for tomorrow.
+
+Both are sent via Telegram's JobQueue. They require Mikey to have sent `/start` to the bot at least once (Telegram restriction — bots can't message users who haven't initiated contact).
+
 ## Architecture
 
 ```
-Telegram <-> main.py (handlers + security gate)
+Telegram <-> main.py (handlers + security gate + JobQueue)
                 |
                 v
         agent.py (Claude Haiku + tool loop)
@@ -222,12 +265,13 @@ Telegram <-> main.py (handlers + security gate)
    calendar_tools.py   database.py
         |                  |
         v                  v
-   Google Calendar      SQLite
+   Google Calendar      SQLite (history, pending actions, learnings)
 ```
 
-- **agent.py** runs the Anthropic tool-use loop, executes calendar tools, and stages proposals.
-- **calendar_tools.py** wraps the Google Calendar API. Every function returns a structured `{success, ..., error}` dict — exceptions never reach the agent.
-- **database.py** persists conversation history (last 15 turns) and pending actions (10-minute TTL).
+- **agent.py** runs the Anthropic tool-use loop with 11 tools (8 calendar + check_day_blocked + block_day + remember_scheduling_lesson), stages proposals as pending actions, and injects saved lessons into every system prompt.
+- **calendar_tools.py** wraps Google Calendar. Every function returns a structured `{success, ..., error}` dict — exceptions never reach the agent.
+- **database.py** persists conversation history (last 15 turns), pending actions (10-min TTL), and long-term learnings (uncapped).
 - **config.py** validates every environment variable at startup with descriptive errors.
+- **main.py** registers the morning/evening JobQueue jobs at fixed EST times.
 
 The bot uses `claude-haiku-4-5-20251001` with `temperature=0` for deterministic scheduling.
